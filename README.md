@@ -24,12 +24,13 @@ A Discord bot that manages a ticketed support queue with private voice rooms.
 - Python 3.10 or newer
 - A Discord application with a Bot user ([create one here](https://discord.com/developers/applications))
 
-### 2. Enable Privileged Intents
+### 2. Enable / Verify Privileged Intents
 
-In the Discord Developer Portal, go to your application → **Bot** tab, and enable:
+In the Discord Developer Portal, go to your application → **Bot** tab:
 
-- ✅ **Server Members Intent**
-- ✅ **Presence Intent** (optional, not required)
+- ✅ **Server Members Intent** — required (the bot resolves members by ID)
+- ✅ **Presence Intent** — optional, not required
+- ❌ **Message Content Intent** — must remain **OFF**. The bot never reads message content, and leaving this off guarantees it cannot scrape chat history.
 
 ### 3. Invite the Bot
 
@@ -55,11 +56,24 @@ Before running the bot, create the following in your Discord server:
 - `Verified` — granted when a ticket is completed
 - `Operator` (or any name) — gives access to staff commands
 
-**Channels (copy their IDs):**
+**Text Channels (copy their IDs):**
 - `#welcome-read-first` — where the Request Support button goes
-- `#queue-board` — where new ticket embeds appear and users are pinged
+- `#queue-board` — where new ticket embeds appear and users are pinged on `/call`
 - `#ops-log` — where all operator actions are logged
-- A voice **Category** for support rooms (optional but recommended)
+
+**Voice Channels — Static Model (copy their IDs):**
+
+The bot uses two **pre-existing** voice channels instead of creating and deleting them dynamically. Create these once in your server:
+
+- **Waiting Room** — ticket holders who are already in voice are staged here when their ticket is called, then immediately moved into the Operator Room.
+- **Operator Room** — the private call channel where the operator and ticket holder meet.
+
+> **Permission setup for Operator Room (do this once in Discord):**
+> - `@everyone` → deny **Connect**, deny **View Channel**
+> - `Operator` role → allow **Connect**, allow **View Channel**, allow **Speak**
+>
+> The bot moves users in and out of this channel; it never creates or deletes it.
+> This avoids Discord's rate limits on channel creation during high ticket volume.
 
 ### 5. Configure Environment Variables
 
@@ -75,7 +89,8 @@ GUILD_ID=your-server-id
 WELCOME_CHANNEL_ID=...
 QUEUE_BOARD_CHANNEL_ID=...
 OPS_LOG_CHANNEL_ID=...
-SUPPORT_CATEGORY_ID=...
+WAITING_ROOM_CHANNEL_ID=...
+OPERATOR_ROOM_CHANNEL_ID=...
 QUEUED_ROLE_ID=...
 VERIFIED_ROLE_ID=...
 OPERATOR_ROLE_ID=...
@@ -141,8 +156,10 @@ Discord-Bot/
 
 ## How the Queue Works
 
-1. A user clicks **Request Support** → ticket is created, Queued role is assigned, DM is sent.
-2. An operator runs `/call` → the oldest queued ticket is fetched, its status becomes `active`, a private voice channel is created, and the user is pinged.
-3. A 10-minute timer starts. If the user does not join the voice channel, `/skip` fires automatically.
+1. A user clicks **Request Support** → ticket is created under a concurrency lock (no race conditions), the Queued role is assigned, and a DM is sent with their ticket number.
+2. An operator runs `/call` → the oldest queued ticket is fetched, its status becomes `active`, and `called_at` is stamped in the database.
+   - If the ticket holder is in a voice channel, the bot moves them through **Waiting Room** → **Operator Room**.
+   - If they are not in voice, a warning embed is posted and the 10-minute timer begins (DB-backed — survives bot restarts).
+3. A background task runs every **60 seconds** and auto-skips any `active` ticket whose `called_at` is older than 10 minutes and whose user is not in the Operator Room.
 4. `/skip` increments the no-show counter. At 2 no-shows the ticket is dropped; otherwise it returns to the back of the queue.
-5. On `/complete`, the Verified role is granted, the Queued role is removed, and the voice channel is deleted.
+5. On `/complete`, the Verified role is granted, the Queued role is removed, and the ticket holder is disconnected from the Operator Room. The channel itself is never deleted.

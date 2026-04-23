@@ -2,16 +2,23 @@
 Queue cog — all slash commands for the Support Queue Bot.
 
 Commands:
-  /queue            – position for users; full list for operators
-  /call [number]    – operator calls next/specific ticket
-  /complete number  – operator completes a ticket
-  /skip number      – operator skips a ticket (no-show logic)
-  /drop number reason – operator drops a ticket with reason
-  /shift on|off     – operator toggles shift status
-  /setup_panel      – admin posts the support button to #welcome-read-first
+  /queue               – position for users; full list for operators
+  /call [number]       – operator calls next/specific ticket
+  /complete <number>   – operator completes a ticket
+  /skip <number>       – operator skips a ticket (no-show logic)
+  /drop <number> <reason> – operator drops a ticket with reason
+  /shift on|off        – operator toggles shift status
+  /setup_panel         – admin posts the support button to #welcome-read-first
+
+Voice model: two pre-existing static channels (no dynamic create/delete).
+  WAITING_ROOM_CHANNEL_ID  – staging area; ticket holder is moved here first.
+  OPERATOR_ROOM_CHANNEL_ID – private call room; both parties end up here.
+
+The 10-minute no-show timer is DB-backed: called_at is stamped on /call and
+main.py's check_stale_tickets loop fires _process_skip for overdue tickets.
+No asyncio.create_task timers are used here.
 """
 
-import asyncio
 import logging
 import os
 from datetime import datetime, timezone
@@ -25,8 +32,42 @@ import database as db
 
 logger = logging.getLogger(__name__)
 
-NO_SHOW_TIMEOUT = 600  # seconds (10 minutes)
 
+# ── Embed factory helpers ─────────────────────────────────────────────────────
+
+def _err_embed(description: str) -> discord.Embed:
+    """Red embed for errors and access-denied messages."""
+    return discord.Embed(description=description, color=discord.Color.red())
+
+
+def _ok_embed(title: str) -> discord.Embed:
+    """Green embed for successful operations."""
+    return discord.Embed(
+        title=title,
+        color=discord.Color.green(),
+        timestamp=discord.utils.utcnow(),
+    )
+
+
+def _info_embed(title: str) -> discord.Embed:
+    """Blue embed for informational / status messages."""
+    return discord.Embed(
+        title=title,
+        color=discord.Color.blue(),
+        timestamp=discord.utils.utcnow(),
+    )
+
+
+def _warn_embed(title: str) -> discord.Embed:
+    """Orange embed for warnings."""
+    return discord.Embed(
+        title=title,
+        color=discord.Color.orange(),
+        timestamp=discord.utils.utcnow(),
+    )
+
+
+# ── Operator check ────────────────────────────────────────────────────────────
 
 def _is_operator(interaction: discord.Interaction) -> bool:
     """Return True if the interaction member holds the configured Operator role."""
@@ -37,50 +78,52 @@ def _is_operator(interaction: discord.Interaction) -> bool:
     return role in interaction.user.roles if role else False
 
 
+# ── Cog ───────────────────────────────────────────────────────────────────────
+
 class QueueCog(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
-        # Maps ticket_number -> asyncio.Task for the 10-min no-show timer
-        self._no_show_tasks: dict[int, asyncio.Task] = {}
 
-    # ────────────────────────────────────────────────────────────────────────
-    # Internal helpers
-    # ────────────────────────────────────────────────────────────────────────
+    # ── Private helpers ───────────────────────────────────────────────────────
 
-    async def _ops_log(
-        self,
-        guild: discord.Guild,
-        message: str,
-        embed: Optional[discord.Embed] = None,
-    ) -> None:
+    async def _ops_log(self, guild: discord.Guild, message: str) -> None:
+        """Post a plain-text line to #ops-log."""
         channel_id = os.getenv("OPS_LOG_CHANNEL_ID")
         if not channel_id:
             return
         channel = guild.get_channel(int(channel_id))
         if channel:
             try:
-                await channel.send(content=message, embed=embed)
+                await channel.send(content=message)
             except (discord.Forbidden, discord.HTTPException) as exc:
                 logger.error("ops-log send failed: %s", exc)
 
-    async def _delete_voice_channel(
-        self, guild: discord.Guild, channel_id: Optional[str], reason: str
+    async def _cleanup_voice(
+        self, guild: discord.Guild, member: Optional[discord.Member]
     ) -> None:
-        if not channel_id:
+        """Disconnect ticket holder from OPERATOR_ROOM_CHANNEL_ID if they are in it.
+
+        With static rooms we never delete a channel — we only move the user out.
+        """
+        if not member:
             return
-        vc = guild.get_channel(int(channel_id))
-        if not vc:
+        op_room_id = os.getenv("OPERATOR_ROOM_CHANNEL_ID")
+        if not op_room_id:
             return
-        # Disconnect everyone first
-        for member in list(vc.members):
+        op_room = guild.get_channel(int(op_room_id))
+        if not op_room:
+            return
+        if (
+            member.voice
+            and member.voice.channel
+            and member.voice.channel.id == op_room.id
+        ):
             try:
                 await member.move_to(None)
-            except (discord.Forbidden, discord.HTTPException):
-                pass
-        try:
-            await vc.delete(reason=reason)
-        except (discord.Forbidden, discord.HTTPException) as exc:
-            logger.error("Could not delete voice channel %s: %s", channel_id, exc)
+            except (discord.Forbidden, discord.HTTPException) as exc:
+                logger.error(
+                    "Failed to disconnect %s from operator room: %s", member.id, exc
+                )
 
     async def _remove_queued_role(
         self, guild: discord.Guild, member: Optional[discord.Member], reason: str
@@ -101,7 +144,11 @@ class QueueCog(commands.Cog):
         ticket_number: int,
         auto: bool = False,
     ) -> None:
-        """Core skip logic: increment no_shows, drop or requeue, clean up VC."""
+        """Core skip logic: increment no_shows, drop or requeue, disconnect from VC.
+
+        Called both by /skip (manual) and the stale-ticket background loop (auto).
+        Re-fetches the ticket from DB so it is safe to call after a restart.
+        """
         ticket = await db.get_ticket(ticket_number)
         if not ticket or ticket["status"] not in ("queued", "active"):
             return
@@ -112,10 +159,14 @@ class QueueCog(commands.Cog):
 
         if no_shows >= 2:
             await db.update_ticket_status(
-                ticket_number, "dropped", closed_at=datetime.now(timezone.utc).isoformat()
+                ticket_number,
+                "dropped",
+                closed_at=datetime.now(timezone.utc).isoformat(),
             )
             await self._remove_queued_role(
-                guild, member, f"Ticket #{ticket_number} dropped after {no_shows} no-shows"
+                guild,
+                member,
+                f"Ticket #{ticket_number} dropped after {no_shows} no-shows",
             )
             result = f"**dropped** after {no_shows} no-shows"
 
@@ -133,11 +184,8 @@ class QueueCog(commands.Cog):
             await db.update_ticket_status(ticket_number, "queued")
             result = f"moved to **back of queue** (no-shows: {no_shows}/2)"
 
-        await self._delete_voice_channel(
-            guild,
-            ticket["voice_channel_id"],
-            reason=f"Ticket #{ticket_number} skipped",
-        )
+        # Disconnect from static operator room (does not delete the channel)
+        await self._cleanup_voice(guild, member)
 
         user_ref = member.mention if member else f"user {ticket['handle_id']}"
         await self._ops_log(
@@ -152,83 +200,53 @@ class QueueCog(commands.Cog):
             result,
         )
 
-    async def _no_show_timer(
-        self,
-        guild: discord.Guild,
-        ticket_number: int,
-        member_id: int,
-    ) -> None:
-        """Wait NO_SHOW_TIMEOUT seconds; auto-skip if user never joined voice."""
-        await asyncio.sleep(NO_SHOW_TIMEOUT)
-
-        ticket = await db.get_ticket(ticket_number)
-        if not ticket or ticket["status"] != "active":
-            return  # already resolved while we waited
-
-        # Check if member is currently in the support voice channel
-        member = guild.get_member(member_id)
-        vc_id = ticket["voice_channel_id"]
-        if vc_id and member and member.voice:
-            vc = guild.get_channel(int(vc_id))
-            if vc and member.voice.channel and member.voice.channel.id == vc.id:
-                return  # user joined in time — do nothing
-
-        logger.info("No-show timer fired for ticket #%d, triggering auto-skip.", ticket_number)
-        await self._process_skip(guild, ticket_number, auto=True)
-
-    # ────────────────────────────────────────────────────────────────────────
-    # /queue
-    # ────────────────────────────────────────────────────────────────────────
+    # ── /queue ────────────────────────────────────────────────────────────────
 
     @app_commands.command(
-        name="queue", description="Check your queue position, or view the full queue (operators)."
+        name="queue",
+        description="Check your queue position, or view the full queue (operators).",
     )
     async def queue_cmd(self, interaction: discord.Interaction) -> None:
         if _is_operator(interaction):
             tickets = await db.get_all_queued_tickets()
+            embed = _info_embed("\U0001f4cb Support Queue")
             if not tickets:
-                await interaction.response.send_message(
-                    "The queue is currently empty.", ephemeral=True
-                )
-                return
-
-            embed = discord.Embed(
-                title="\U0001f4cb Support Queue",
-                color=discord.Color.blue(),
-                timestamp=discord.utils.utcnow(),
-            )
-            lines = []
-            for idx, t in enumerate(tickets, 1):
-                m = interaction.guild.get_member(int(t["handle_id"]))
-                display = m.display_name if m else f"<ID {t['handle_id']}>"
-                lines.append(
-                    f"**#{idx}** — Ticket **#{t['number']}** | {display} | "
-                    f"No-shows: {t['no_shows']}"
-                )
-            embed.description = "\n".join(lines)
-            embed.set_footer(text=f"Total queued: {len(tickets)}")
+                embed.description = "The queue is currently empty."
+            else:
+                lines = []
+                for idx, t in enumerate(tickets, 1):
+                    m = interaction.guild.get_member(int(t["handle_id"]))
+                    display = m.display_name if m else f"<ID {t['handle_id']}>"
+                    lines.append(
+                        f"**#{idx}** — Ticket **#{t['number']}** | {display} | "
+                        f"No-shows: {t['no_shows']}"
+                    )
+                embed.description = "\n".join(lines)
+                embed.set_footer(text=f"Total queued: {len(tickets)}")
             await interaction.response.send_message(embed=embed, ephemeral=True)
+
         else:
             ticket = await db.get_active_ticket_for_user(str(interaction.user.id))
             if not ticket:
                 await interaction.response.send_message(
-                    "You don't have an active ticket. "
-                    "Use the **Request Support** button to join the queue.",
+                    embed=_err_embed(
+                        "You don't have an active ticket. "
+                        "Use the **Request Support** button to join the queue."
+                    ),
                     ephemeral=True,
                 )
                 return
+
             position = await db.get_queue_position(str(interaction.user.id))
             estimated = position * 5
-            await interaction.response.send_message(
-                f"\U0001f3ab **Your Queue Status**\n"
-                f"Ticket: **#{ticket['number']}** | Status: `{ticket['status']}`\n"
-                f"Position: **#{position}** | Estimated wait: **~{estimated} min**",
-                ephemeral=True,
-            )
+            embed = _info_embed("\U0001f3ab Your Queue Status")
+            embed.add_field(name="Ticket", value=f"#{ticket['number']}", inline=True)
+            embed.add_field(name="Status", value=f"`{ticket['status']}`", inline=True)
+            embed.add_field(name="Position", value=f"#{position}", inline=True)
+            embed.add_field(name="Estimated Wait", value=f"~{estimated} min", inline=True)
+            await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    # ────────────────────────────────────────────────────────────────────────
-    # /call
-    # ────────────────────────────────────────────────────────────────────────
+    # ── /call ─────────────────────────────────────────────────────────────────
 
     @app_commands.command(
         name="call",
@@ -240,17 +258,21 @@ class QueueCog(commands.Cog):
     ) -> None:
         if not _is_operator(interaction):
             await interaction.response.send_message(
-                "Only operators can use this command.", ephemeral=True
+                embed=_err_embed("Only operators can use this command."),
+                ephemeral=True,
             )
             return
 
         await interaction.response.defer(ephemeral=True)
 
+        # ── Fetch ticket ──────────────────────────────────────────────────────
         if number is not None:
             ticket = await db.get_ticket(number)
             if not ticket or ticket["status"] != "queued":
                 await interaction.followup.send(
-                    f"Ticket #{number} not found or is not in `queued` status.",
+                    embed=_err_embed(
+                        f"Ticket #{number} was not found or is not in `queued` status."
+                    ),
                     ephemeral=True,
                 )
                 return
@@ -258,100 +280,120 @@ class QueueCog(commands.Cog):
             ticket = await db.get_next_queued_ticket()
             if not ticket:
                 await interaction.followup.send(
-                    "The queue is empty — nothing to call.", ephemeral=True
+                    embed=_info_embed("\U0001f4cb Queue Empty").add_field(
+                        name="Status", value="No tickets are currently queued."
+                    ),
+                    ephemeral=True,
                 )
                 return
 
         ticket_number = ticket["number"]
         member = interaction.guild.get_member(int(ticket["handle_id"]))
         operator = interaction.user
-        now = datetime.now(timezone.utc).isoformat()
 
-        await db.update_ticket_status(ticket_number, "active", called_at=now)
-
-        # ── Create private voice channel ─────────────────────────────────────
-        category_id = os.getenv("SUPPORT_CATEGORY_ID")
-        category = (
-            interaction.guild.get_channel(int(category_id))
-            if category_id
-            else None
+        # Stamp called_at so the DB-backed stale-ticket loop can time out no-shows
+        await db.update_ticket_status(
+            ticket_number,
+            "active",
+            called_at=datetime.now(timezone.utc).isoformat(),
         )
 
-        overwrites: dict = {
-            interaction.guild.default_role: discord.PermissionOverwrite(
-                connect=False, view_channel=False
-            ),
-            operator: discord.PermissionOverwrite(
-                connect=True, view_channel=True, speak=True, move_members=True
-            ),
-        }
-        if member:
-            overwrites[member] = discord.PermissionOverwrite(
-                connect=True, view_channel=True, speak=True
-            )
+        # ── Resolve static voice channels ─────────────────────────────────────
+        waiting_room_id = os.getenv("WAITING_ROOM_CHANNEL_ID")
+        op_room_id = os.getenv("OPERATOR_ROOM_CHANNEL_ID")
+        waiting_room = (
+            interaction.guild.get_channel(int(waiting_room_id)) if waiting_room_id else None
+        )
+        op_room = (
+            interaction.guild.get_channel(int(op_room_id)) if op_room_id else None
+        )
 
-        voice_channel: Optional[discord.VoiceChannel] = None
-        try:
-            voice_channel = await interaction.guild.create_voice_channel(
-                name=f"Support Room #{ticket_number}",
-                category=category,
-                overwrites=overwrites,
-                reason=f"Support ticket #{ticket_number} called by {operator}",
-            )
-            await db.set_ticket_voice_channel(ticket_number, str(voice_channel.id))
-        except (discord.Forbidden, discord.HTTPException) as exc:
-            logger.error(
-                "Failed to create voice channel for ticket #%d: %s", ticket_number, exc
-            )
+        # ── Move operator to OPERATOR_ROOM (voice-state guard) ────────────────
+        if op_room and operator.voice is not None:
+            try:
+                await operator.move_to(op_room)
+            except (discord.Forbidden, discord.HTTPException) as exc:
+                logger.warning("Could not move operator to operator room: %s", exc)
 
-        # ── Notify user in queue-board / ops-log channel ─────────────────────
+        # ── Handle ticket-holder voice state ──────────────────────────────────
+        user_in_voice = member is not None and member.voice is not None
+        op_room_ref = op_room.mention if op_room else "`OPERATOR_ROOM_CHANNEL_ID not set`"
+
+        if user_in_voice:
+            # Stage through WAITING_ROOM, then move into OPERATOR_ROOM
+            if waiting_room:
+                try:
+                    await member.move_to(waiting_room)
+                except (discord.Forbidden, discord.HTTPException) as exc:
+                    logger.error(
+                        "Failed to move user %s to waiting room: %s", member.id, exc
+                    )
+            if op_room:
+                try:
+                    await member.move_to(op_room)
+                except (discord.Forbidden, discord.HTTPException) as exc:
+                    logger.error(
+                        "Failed to move user %s to operator room: %s", member.id, exc
+                    )
+
+        # ── Notify ticket holder in queue-board / ops-log ─────────────────────
         notify_channel_id = os.getenv("QUEUE_BOARD_CHANNEL_ID") or os.getenv(
             "OPS_LOG_CHANNEL_ID"
         )
         if notify_channel_id:
-            notify_channel = interaction.guild.get_channel(int(notify_channel_id))
-            if notify_channel:
-                vc_ref = voice_channel.mention if voice_channel else "a support voice channel"
-                ping = member.mention if member else f"<Ticket holder {ticket['handle_id']}>"
-                try:
-                    await notify_channel.send(
-                        f"\U0001f514 {ping} — your ticket **#{ticket_number}** is ready! "
-                        f"Please join {vc_ref} now. You have **10 minutes** before your spot is skipped."
+            notify_ch = interaction.guild.get_channel(int(notify_channel_id))
+            if notify_ch:
+                ping = member.mention if member else f"<ID {ticket['handle_id']}>"
+                if not user_in_voice:
+                    # Warning embed: user is not currently in voice
+                    warn = _warn_embed("⚠️ User Not in Voice")
+                    warn.description = (
+                        f"{ping}, your ticket **#{ticket_number}** is ready!\n"
+                        f"Please join {op_room_ref} within **10 minutes** "
+                        "or your spot will be skipped."
                     )
-                except (discord.Forbidden, discord.HTTPException) as exc:
-                    logger.error("Failed to ping user for ticket #%d: %s", ticket_number, exc)
+                    try:
+                        await notify_ch.send(embed=warn)
+                    except (discord.Forbidden, discord.HTTPException) as exc:
+                        logger.error(
+                            "Failed to send voice warning for ticket #%d: %s",
+                            ticket_number,
+                            exc,
+                        )
+                else:
+                    try:
+                        await notify_ch.send(
+                            f"\U0001f514 {ping} — ticket **#{ticket_number}** is active! "
+                            f"You have been moved to {op_room_ref}."
+                        )
+                    except (discord.Forbidden, discord.HTTPException) as exc:
+                        logger.error(
+                            "Failed to notify user for ticket #%d: %s", ticket_number, exc
+                        )
 
-        # ── Move operator into voice channel (if already in one) ─────────────
-        if voice_channel and operator.voice:
-            try:
-                await operator.move_to(voice_channel)
-            except (discord.Forbidden, discord.HTTPException) as exc:
-                logger.warning("Could not move operator to VC: %s", exc)
-
-        # ── Start no-show timer ──────────────────────────────────────────────
-        if member:
-            task = asyncio.create_task(
-                self._no_show_timer(interaction.guild, ticket_number, member.id)
-            )
-            self._no_show_tasks[ticket_number] = task
-
-        vc_info = f"\nVoice channel: {voice_channel.mention}" if voice_channel else ""
+        # ── Reply to operator ─────────────────────────────────────────────────
         user_ref = member.mention if member else f"user `{ticket['handle_id']}`"
-        await interaction.followup.send(
-            f"\U0001f4de Called ticket **#{ticket_number}** for {user_ref}.{vc_info}\n"
-            "10-minute no-show timer has started.",
-            ephemeral=True,
+        voice_status = (
+            "Moved to voice ✓"
+            if user_in_voice
+            else "⚠️ Not in voice — 10-min timer started"
         )
+        embed = _ok_embed("\U0001f4de Ticket Called")
+        embed.add_field(name="Ticket", value=f"#{ticket_number}", inline=True)
+        embed.add_field(name="User", value=user_ref, inline=True)
+        embed.add_field(name="Operator Room", value=op_room_ref, inline=True)
+        embed.add_field(name="Voice Status", value=voice_status, inline=False)
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
         logger.info(
-            "Operator %s called ticket #%d | user=%s",
+            "Operator %s called ticket #%d | user=%s | user_in_voice=%s",
             operator.id,
             ticket_number,
             ticket["handle_id"],
+            user_in_voice,
         )
 
-    # ────────────────────────────────────────────────────────────────────────
-    # /complete
-    # ────────────────────────────────────────────────────────────────────────
+    # ── /complete ─────────────────────────────────────────────────────────────
 
     @app_commands.command(
         name="complete",
@@ -361,7 +403,8 @@ class QueueCog(commands.Cog):
     async def complete_cmd(self, interaction: discord.Interaction, number: int) -> None:
         if not _is_operator(interaction):
             await interaction.response.send_message(
-                "Only operators can use this command.", ephemeral=True
+                embed=_err_embed("Only operators can use this command."),
+                ephemeral=True,
             )
             return
 
@@ -370,16 +413,18 @@ class QueueCog(commands.Cog):
         ticket = await db.get_ticket(number)
         if not ticket or ticket["status"] != "active":
             await interaction.followup.send(
-                f"Ticket #{number} not found or is not `active`.", ephemeral=True
+                embed=_err_embed(
+                    f"Ticket #{number} was not found or is not in `active` status."
+                ),
+                ephemeral=True,
             )
             return
 
-        now = datetime.now(timezone.utc).isoformat()
-        await db.update_ticket_status(number, "completed", closed_at=now)
-
-        # Cancel no-show timer if it's still running
-        if number in self._no_show_tasks:
-            self._no_show_tasks.pop(number).cancel()
+        await db.update_ticket_status(
+            number,
+            "completed",
+            closed_at=datetime.now(timezone.utc).isoformat(),
+        )
 
         member = interaction.guild.get_member(int(ticket["handle_id"]))
 
@@ -394,18 +439,15 @@ class QueueCog(commands.Cog):
                             verified_role, reason=f"Ticket #{number} completed"
                         )
                     except (discord.Forbidden, discord.HTTPException) as exc:
-                        logger.error("Failed to add Verified role to %s: %s", member.id, exc)
-
+                        logger.error(
+                            "Failed to add Verified role to %s: %s", member.id, exc
+                        )
             await self._remove_queued_role(
                 interaction.guild, member, f"Ticket #{number} completed"
             )
 
-        # ── Clean up voice channel ────────────────────────────────────────────
-        await self._delete_voice_channel(
-            interaction.guild,
-            ticket["voice_channel_id"],
-            reason=f"Ticket #{number} completed",
-        )
+        # ── Disconnect ticket holder from operator room ───────────────────────
+        await self._cleanup_voice(interaction.guild, member)
 
         user_ref = member.mention if member else f"user `{ticket['handle_id']}`"
         await self._ops_log(
@@ -413,11 +455,13 @@ class QueueCog(commands.Cog):
             f"✅ Ticket **#{number}** completed by {interaction.user.mention}. "
             f"User: {user_ref}",
         )
-        await interaction.followup.send(
-            f"✅ Ticket **#{number}** marked as completed. "
-            f"{user_ref} has been granted the Verified role.",
-            ephemeral=True,
-        )
+
+        embed = _ok_embed("✅ Ticket Completed")
+        embed.add_field(name="Ticket", value=f"#{number}", inline=True)
+        embed.add_field(name="User", value=user_ref, inline=True)
+        embed.add_field(name="Verified Role", value="Granted ✓", inline=True)
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
         logger.info(
             "Operator %s completed ticket #%d | user=%s",
             interaction.user.id,
@@ -425,9 +469,7 @@ class QueueCog(commands.Cog):
             ticket["handle_id"],
         )
 
-    # ────────────────────────────────────────────────────────────────────────
-    # /skip
-    # ────────────────────────────────────────────────────────────────────────
+    # ── /skip ─────────────────────────────────────────────────────────────────
 
     @app_commands.command(
         name="skip",
@@ -437,7 +479,8 @@ class QueueCog(commands.Cog):
     async def skip_cmd(self, interaction: discord.Interaction, number: int) -> None:
         if not _is_operator(interaction):
             await interaction.response.send_message(
-                "Only operators can use this command.", ephemeral=True
+                embed=_err_embed("Only operators can use this command."),
+                ephemeral=True,
             )
             return
 
@@ -445,31 +488,28 @@ class QueueCog(commands.Cog):
 
         ticket = await db.get_ticket(number)
         if not ticket or ticket["status"] not in ("queued", "active"):
+            current = ticket["status"] if ticket else "not found"
             await interaction.followup.send(
-                f"Ticket #{number} not found or cannot be skipped (status: "
-                f"`{ticket['status'] if ticket else 'not found'}`).",
+                embed=_err_embed(
+                    f"Ticket #{number} cannot be skipped (current status: `{current}`)."
+                ),
                 ephemeral=True,
             )
             return
 
-        # Cancel running timer so it doesn't fire again
-        if number in self._no_show_tasks:
-            self._no_show_tasks.pop(number).cancel()
-
         await self._process_skip(interaction.guild, number, auto=False)
 
-        # Fetch fresh to report result
         updated = await db.get_ticket(number)
-        status_str = updated["status"] if updated else "unknown"
-        await interaction.followup.send(
-            f"Ticket **#{number}** has been skipped. New status: `{status_str}`.",
-            ephemeral=True,
-        )
+        new_status = updated["status"] if updated else "unknown"
+
+        embed = _warn_embed("⏭️ Ticket Skipped")
+        embed.add_field(name="Ticket", value=f"#{number}", inline=True)
+        embed.add_field(name="New Status", value=f"`{new_status}`", inline=True)
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
         logger.info("Operator %s skipped ticket #%d", interaction.user.id, number)
 
-    # ────────────────────────────────────────────────────────────────────────
-    # /drop
-    # ────────────────────────────────────────────────────────────────────────
+    # ── /drop ─────────────────────────────────────────────────────────────────
 
     @app_commands.command(
         name="drop",
@@ -484,7 +524,8 @@ class QueueCog(commands.Cog):
     ) -> None:
         if not _is_operator(interaction):
             await interaction.response.send_message(
-                "Only operators can use this command.", ephemeral=True
+                embed=_err_embed("Only operators can use this command."),
+                ephemeral=True,
             )
             return
 
@@ -493,17 +534,18 @@ class QueueCog(commands.Cog):
         ticket = await db.get_ticket(number)
         if not ticket or ticket["status"] in ("completed", "dropped"):
             await interaction.followup.send(
-                f"Ticket #{number} not found or is already closed.",
+                embed=_err_embed(
+                    f"Ticket #{number} was not found or is already closed."
+                ),
                 ephemeral=True,
             )
             return
 
-        now = datetime.now(timezone.utc).isoformat()
-        await db.update_ticket_status(number, "dropped", closed_at=now)
-
-        # Cancel running no-show timer
-        if number in self._no_show_tasks:
-            self._no_show_tasks.pop(number).cancel()
+        await db.update_ticket_status(
+            number,
+            "dropped",
+            closed_at=datetime.now(timezone.utc).isoformat(),
+        )
 
         member = interaction.guild.get_member(int(ticket["handle_id"]))
 
@@ -511,7 +553,7 @@ class QueueCog(commands.Cog):
             interaction.guild, member, f"Ticket #{number} dropped: {reason}"
         )
 
-        # DM the user
+        # DM the user with drop reason
         if member:
             try:
                 await member.send(
@@ -522,12 +564,8 @@ class QueueCog(commands.Cog):
             except (discord.Forbidden, discord.HTTPException):
                 pass
 
-        # Clean up any voice channel
-        await self._delete_voice_channel(
-            interaction.guild,
-            ticket["voice_channel_id"],
-            reason=f"Ticket #{number} dropped",
-        )
+        # Disconnect ticket holder from operator room
+        await self._cleanup_voice(interaction.guild, member)
 
         user_ref = member.mention if member else f"user `{ticket['handle_id']}`"
         await self._ops_log(
@@ -535,9 +573,17 @@ class QueueCog(commands.Cog):
             f"\U0001f6ab Ticket **#{number}** dropped by {interaction.user.mention}.\n"
             f"**Reason:** {reason} | User: {user_ref}",
         )
-        await interaction.followup.send(
-            f"Ticket **#{number}** dropped. Reason: {reason}", ephemeral=True
+
+        embed = discord.Embed(
+            title="\U0001f6ab Ticket Dropped",
+            color=discord.Color.red(),
+            timestamp=discord.utils.utcnow(),
         )
+        embed.add_field(name="Ticket", value=f"#{number}", inline=True)
+        embed.add_field(name="User", value=user_ref, inline=True)
+        embed.add_field(name="Reason", value=reason, inline=False)
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
         logger.info(
             "Operator %s dropped ticket #%d | reason=%s",
             interaction.user.id,
@@ -545,9 +591,7 @@ class QueueCog(commands.Cog):
             reason,
         )
 
-    # ────────────────────────────────────────────────────────────────────────
-    # /shift
-    # ────────────────────────────────────────────────────────────────────────
+    # ── /shift ────────────────────────────────────────────────────────────────
 
     @app_commands.command(
         name="shift",
@@ -560,12 +604,11 @@ class QueueCog(commands.Cog):
             app_commands.Choice(name="Off", value="off"),
         ]
     )
-    async def shift_cmd(
-        self, interaction: discord.Interaction, status: str
-    ) -> None:
+    async def shift_cmd(self, interaction: discord.Interaction, status: str) -> None:
         if not _is_operator(interaction):
             await interaction.response.send_message(
-                "Only operators can use this command.", ephemeral=True
+                embed=_err_embed("Only operators can use this command."),
+                ephemeral=True,
             )
             return
 
@@ -577,8 +620,7 @@ class QueueCog(commands.Cog):
             if active_count > 0:
                 warning = (
                     f"\n⚠️ **Warning:** There are **{active_count}** "
-                    "active ticket(s) currently in progress. Make sure they are "
-                    "handed off or resolved."
+                    "active ticket(s) in progress. Make sure they are handed off or resolved."
                 )
 
         await db.set_operator_status(str(interaction.user.id), status)
@@ -593,9 +635,7 @@ class QueueCog(commands.Cog):
         )
         logger.info("Operator %s set shift to %s", interaction.user.id, status)
 
-    # ────────────────────────────────────────────────────────────────────────
-    # /setup_panel  (admin only — posts the button to #welcome-read-first)
-    # ────────────────────────────────────────────────────────────────────────
+    # ── /setup_panel ──────────────────────────────────────────────────────────
 
     @app_commands.command(
         name="setup_panel",
@@ -604,21 +644,24 @@ class QueueCog(commands.Cog):
     async def setup_panel_cmd(self, interaction: discord.Interaction) -> None:
         if not interaction.user.guild_permissions.administrator:
             await interaction.response.send_message(
-                "Only server administrators can use this command.", ephemeral=True
+                embed=_err_embed("Only server administrators can use this command."),
+                ephemeral=True,
             )
             return
 
         channel_id = os.getenv("WELCOME_CHANNEL_ID")
         if not channel_id:
             await interaction.response.send_message(
-                "WELCOME_CHANNEL_ID is not set in the `.env` file.", ephemeral=True
+                embed=_err_embed("WELCOME_CHANNEL_ID is not set in the `.env` file."),
+                ephemeral=True,
             )
             return
 
         channel = interaction.guild.get_channel(int(channel_id))
         if not channel:
             await interaction.response.send_message(
-                f"Could not find a channel with ID `{channel_id}`.", ephemeral=True
+                embed=_err_embed(f"Could not find a channel with ID `{channel_id}`."),
+                ephemeral=True,
             )
             return
 
@@ -642,14 +685,18 @@ class QueueCog(commands.Cog):
         try:
             await channel.send(embed=embed, view=RequestSupportView())
             await interaction.response.send_message(
-                f"✅ Support panel posted to {channel.mention}!", ephemeral=True
+                embed=_ok_embed(f"✅ Panel posted to {channel.mention}!"),
+                ephemeral=True,
             )
             logger.info(
-                "Admin %s posted support panel to channel %s", interaction.user.id, channel_id
+                "Admin %s posted support panel to channel %s",
+                interaction.user.id,
+                channel_id,
             )
         except (discord.Forbidden, discord.HTTPException) as exc:
             await interaction.response.send_message(
-                f"Failed to post panel: {exc}", ephemeral=True
+                embed=_err_embed(f"Failed to post panel: {exc}"),
+                ephemeral=True,
             )
 
 

@@ -135,6 +135,29 @@ async def get_active_tickets_count() -> int:
             return row[0] if row else 0
 
 
+async def get_stale_active_tickets(timeout_minutes: int = 10) -> list:
+    """Return active tickets whose called_at is older than timeout_minutes.
+
+    Used by the background stale-ticket checker to auto-skip no-shows that
+    survived a bot restart (where in-memory timers would have been lost).
+    """
+    cutoff = (
+        datetime.now(timezone.utc) - timedelta(minutes=timeout_minutes)
+    ).isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """
+            SELECT * FROM tickets
+            WHERE status = 'active'
+              AND called_at IS NOT NULL
+              AND called_at < ?
+            """,
+            (cutoff,),
+        ) as cur:
+            return await cur.fetchall()
+
+
 async def update_ticket_status(
     number: int,
     status: str,
