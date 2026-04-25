@@ -18,17 +18,16 @@ logger = logging.getLogger(__name__)
 async def init_db() -> None:
     """Create tables if they do not already exist."""
     async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("PRAGMA journal_mode=WAL")
         await db.execute("""
             CREATE TABLE IF NOT EXISTS tickets (
                 number           INTEGER PRIMARY KEY AUTOINCREMENT,
                 handle_id        TEXT    NOT NULL,
-                referrer_id      TEXT    DEFAULT NULL,
                 created_at       TIMESTAMP NOT NULL,
                 called_at        TIMESTAMP DEFAULT NULL,
                 closed_at        TIMESTAMP DEFAULT NULL,
                 no_shows         INTEGER NOT NULL DEFAULT 0,
-                status           TEXT    NOT NULL DEFAULT 'queued',
-                voice_channel_id TEXT    DEFAULT NULL
+                status           TEXT    NOT NULL DEFAULT 'queued'
             )
         """)
         await db.execute("""
@@ -38,6 +37,8 @@ async def init_db() -> None:
                 last_shift_change TIMESTAMP NOT NULL
             )
         """)
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_tickets_status ON tickets(status)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_tickets_handle_id ON tickets(handle_id)")
         await db.commit()
     logger.info("Database initialised at %s", DB_PATH)
 
@@ -46,16 +47,16 @@ async def init_db() -> None:
 # Ticket helpers
 # ---------------------------------------------------------------------------
 
-async def create_ticket(handle_id: str, referrer_id: Optional[str] = None) -> int:
+async def create_ticket(handle_id: str) -> int:
     """Insert a new queued ticket and return its auto-incremented number."""
     now = _now()
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
             """
-            INSERT INTO tickets (handle_id, referrer_id, created_at, status)
-            VALUES (?, ?, ?, 'queued')
+            INSERT INTO tickets (handle_id, created_at, status)
+            VALUES (?, ?, 'queued')
             """,
-            (handle_id, referrer_id, now),
+            (handle_id, now),
         )
         await db.commit()
         return cursor.lastrowid
@@ -189,29 +190,16 @@ async def update_ticket_status(
         await db.commit()
 
 
-async def set_ticket_voice_channel(number: int, channel_id: str) -> None:
-    """Store the private voice channel ID against a ticket."""
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE tickets SET voice_channel_id = ? WHERE number = ?",
-            (channel_id, number),
-        )
-        await db.commit()
-
-
 async def increment_no_shows(number: int) -> int:
     """Increment no_shows and return the new count."""
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE tickets SET no_shows = no_shows + 1 WHERE number = ?",
-            (number,),
-        )
-        await db.commit()
         async with db.execute(
-            "SELECT no_shows FROM tickets WHERE number = ?", (number,)
+            "UPDATE tickets SET no_shows = no_shows + 1 WHERE number = ? RETURNING no_shows",
+            (number,),
         ) as cur:
             row = await cur.fetchone()
-            return row[0] if row else 0
+        await db.commit()
+        return row[0] if row else 0
 
 
 async def move_ticket_to_back(number: int) -> None:
@@ -219,6 +207,20 @@ async def move_ticket_to_back(number: int) -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "UPDATE tickets SET created_at = ? WHERE number = ?",
+            (_now(), number),
+        )
+        await db.commit()
+
+
+async def requeue_ticket(number: int) -> None:
+    """Reset a ticket back into the queue in a single statement."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            UPDATE tickets
+            SET created_at = ?, status = 'queued', called_at = NULL
+            WHERE number = ?
+            """,
             (_now(), number),
         )
         await db.commit()

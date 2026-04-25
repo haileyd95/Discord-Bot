@@ -7,6 +7,7 @@ Start with:  python main.py
 import asyncio
 import logging
 import os
+from datetime import datetime, timezone
 
 import discord
 from discord import app_commands
@@ -36,6 +37,8 @@ intents.voice_states = True
 
 # ── Bot ───────────────────────────────────────────────────────────────────────
 bot = commands.Bot(command_prefix="\x00", intents=intents)  # prefix unused; slash-only
+
+_commands_synced = False
 
 
 # ── Background task: 30-day data purge ───────────────────────────────────────
@@ -96,7 +99,15 @@ async def check_stale_tickets() -> None:
             "Stale ticket #%d: active >10 min, user not in operator room — auto-skipping.",
             ticket["number"],
         )
-        await cog._process_skip(guild, ticket["number"], auto=True)
+        try:
+            await cog._process_skip(guild, ticket["number"], auto=True)
+        except Exception as exc:
+            logger.exception(
+                "Auto-skip of stale ticket #%d failed: %s",
+                ticket["number"],
+                exc,
+            )
+            continue
 
 
 @check_stale_tickets.before_loop
@@ -107,27 +118,77 @@ async def before_stale_check() -> None:
 # ── Bot events ────────────────────────────────────────────────────────────────
 @bot.event
 async def on_ready() -> None:
+    global _commands_synced
     logger.info("Logged in as %s (ID: %s)", bot.user, bot.user.id)
 
     # Re-register the persistent view so the button still works after a restart.
     bot.add_view(RequestSupportView())
 
-    # Sync slash commands — guild-scoped for instant propagation during dev,
-    # or global when GUILD_ID is not set (takes ~1 hour to propagate).
-    guild_id = os.getenv("GUILD_ID")
-    if guild_id:
-        guild_obj = discord.Object(id=int(guild_id))
-        bot.tree.copy_global_to(guild=guild_obj)
-        synced = await bot.tree.sync(guild=guild_obj)
-        logger.info("Synced %d command(s) to guild %s.", len(synced), guild_id)
-    else:
-        synced = await bot.tree.sync()
-        logger.info("Synced %d global command(s).", len(synced))
+    # Sync slash commands once per process — guild-scoped for instant
+    # propagation during dev, or global when GUILD_ID is not set.
+    if not _commands_synced:
+        guild_id = os.getenv("GUILD_ID")
+        if guild_id:
+            guild_obj = discord.Object(id=int(guild_id))
+            bot.tree.copy_global_to(guild=guild_obj)
+            synced = await bot.tree.sync(guild=guild_obj)
+            logger.info("Synced %d command(s) to guild %s.", len(synced), guild_id)
+        else:
+            synced = await bot.tree.sync()
+            logger.info("Synced %d global command(s).", len(synced))
+        _commands_synced = True
 
     if not daily_purge.is_running():
         daily_purge.start()
     if not check_stale_tickets.is_running():
         check_stale_tickets.start()
+
+
+@bot.event
+async def on_member_remove(member: discord.Member) -> None:
+    """Auto-drop any active or queued ticket when a user leaves the server."""
+    try:
+        ticket = await db.get_active_ticket_for_user(str(member.id))
+    except Exception as exc:
+        logger.exception("Failed to look up ticket for departing member %s: %s", member.id, exc)
+        return
+
+    if not ticket:
+        return
+
+    try:
+        await db.update_ticket_status(
+            ticket["number"],
+            "dropped",
+            closed_at=datetime.now(timezone.utc).isoformat(),
+        )
+    except Exception as exc:
+        logger.exception(
+            "Failed to auto-drop ticket #%d for departed user %s: %s",
+            ticket["number"],
+            member.id,
+            exc,
+        )
+        return
+
+    logger.info(
+        "Auto-dropped ticket #%d for departing user %s (%s).",
+        ticket["number"],
+        member.id,
+        member.name,
+    )
+
+    ops_log_id = os.getenv("OPS_LOG_CHANNEL_ID")
+    if ops_log_id and member.guild:
+        ops_channel = member.guild.get_channel(int(ops_log_id))
+        if ops_channel:
+            try:
+                await ops_channel.send(
+                    f"\U0001f6aa Ticket **#{ticket['number']}** auto-dropped — "
+                    f"user {member.mention} (`{member.id}`) left the server."
+                )
+            except (discord.Forbidden, discord.HTTPException) as exc:
+                logger.error("Failed to log auto-drop to ops-log: %s", exc)
 
 
 @bot.event
@@ -163,14 +224,46 @@ async def on_app_command_error(
         pass
 
 
+# ── Environment validation ────────────────────────────────────────────────────
+def _validate_env() -> None:
+    """Validate every required environment variable before the bot starts."""
+    required_numeric = (
+        "GUILD_ID",
+        "WELCOME_CHANNEL_ID",
+        "QUEUE_BOARD_CHANNEL_ID",
+        "OPS_LOG_CHANNEL_ID",
+        "WAITING_ROOM_CHANNEL_ID",
+        "OPERATOR_ROOM_CHANNEL_ID",
+        "QUEUED_ROLE_ID",
+        "VERIFIED_ROLE_ID",
+        "OPERATOR_ROLE_ID",
+    )
+
+    token = (os.getenv("DISCORD_TOKEN") or "").strip()
+    if not token:
+        raise SystemExit(
+            "DISCORD_TOKEN is missing or empty. Copy .env.example to .env and "
+            "fill in every value before starting the bot."
+        )
+
+    for name in required_numeric:
+        raw = (os.getenv(name) or "").strip()
+        if not raw:
+            raise SystemExit(
+                f"{name} is missing or empty. Copy .env.example to .env and "
+                "fill in every required value before starting the bot."
+            )
+        if not raw.isdigit():
+            raise SystemExit(
+                f"{name} must be a numeric Discord ID (got {raw!r}). "
+                "Right-click the server/channel/role in Discord and choose Copy ID."
+            )
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 async def main() -> None:
-    token = os.getenv("DISCORD_TOKEN")
-    if not token:
-        logger.critical(
-            "DISCORD_TOKEN is not set. Copy .env.example to .env and fill in your token."
-        )
-        return
+    _validate_env()
+    token = os.getenv("DISCORD_TOKEN").strip()
 
     await db.init_db()
 
