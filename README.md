@@ -40,7 +40,6 @@ Use the OAuth2 URL Generator (**OAuth2 → URL Generator**):
 
 **Bot Permissions:**
 - Manage Roles
-- Manage Channels
 - Move Members
 - Send Messages
 - Embed Links
@@ -74,6 +73,11 @@ The bot uses two **pre-existing** voice channels instead of creating and deletin
 >
 > The bot moves users in and out of this channel; it never creates or deletes it.
 > This avoids Discord's rate limits on channel creation during high ticket volume.
+
+> **Note (March 2026):** Discord now requires DAVE (E2E encryption) for voice
+> conversations. This bot only **moves users between voice channels** and does
+> not join voice itself, so DAVE has no impact on the bot's behaviour — the
+> participants' Discord clients handle DAVE end-to-end.
 
 ### 5. Configure Environment Variables
 

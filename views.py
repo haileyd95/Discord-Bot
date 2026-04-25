@@ -15,8 +15,7 @@ import database as db
 
 logger = logging.getLogger(__name__)
 
-# Serialises concurrent button clicks so queue positions are always accurate.
-TICKET_LOCK = asyncio.Lock()
+_user_locks: dict[str, asyncio.Lock] = {}
 
 
 class RequestSupportView(discord.ui.View):
@@ -39,40 +38,46 @@ class RequestSupportView(discord.ui.View):
         user = interaction.user
         guild = interaction.guild
 
-        async with TICKET_LOCK:
-            # ── Guard: one active ticket per user ────────────────────────────
-            existing = await db.get_active_ticket_for_user(str(user.id))
-            if existing:
-                await interaction.followup.send(
-                    f"You already have an open ticket **#{existing['number']}** "
-                    f"(status: `{existing['status']}`). "
-                    "Please wait for it to be resolved before requesting a new one.",
-                    ephemeral=True,
-                )
-                return
+        user_key = str(user.id)
+        lock = _user_locks.setdefault(user_key, asyncio.Lock())
+        try:
+            async with lock:
+                # ── Guard: one active ticket per user ────────────────────────
+                existing = await db.get_active_ticket_for_user(user_key)
+                if existing:
+                    await interaction.followup.send(
+                        f"You already have an open ticket **#{existing['number']}** "
+                        f"(status: `{existing['status']}`). "
+                        "Please wait for it to be resolved before requesting a new one.",
+                        ephemeral=True,
+                    )
+                    return
 
-            # ── Assign Queued role ───────────────────────────────────────────
-            queued_role_id = os.getenv("QUEUED_ROLE_ID")
-            if queued_role_id:
-                queued_role = guild.get_role(int(queued_role_id))
-                if queued_role:
-                    try:
-                        await user.add_roles(queued_role, reason="Support ticket requested")
-                    except discord.Forbidden:
-                        logger.error(
-                            "Missing permissions to assign Queued role to user %s", user.id
-                        )
-                    except discord.HTTPException as exc:
-                        logger.error("Failed to assign Queued role to %s: %s", user.id, exc)
+                # ── Assign Queued role ───────────────────────────────────────
+                queued_role_id = os.getenv("QUEUED_ROLE_ID")
+                if queued_role_id:
+                    queued_role = guild.get_role(int(queued_role_id))
+                    if queued_role:
+                        try:
+                            await user.add_roles(queued_role, reason="Support ticket requested")
+                        except discord.Forbidden:
+                            logger.error(
+                                "Missing permissions to assign Queued role to user %s", user.id
+                            )
+                        except discord.HTTPException as exc:
+                            logger.error("Failed to assign Queued role to %s: %s", user.id, exc)
 
-            # ── Create ticket in DB (atomic under lock) ──────────────────────
-            ticket_number = await db.create_ticket(str(user.id))
-            position = await db.get_queue_position(str(user.id))
+                # ── Create ticket in DB (atomic under lock) ──────────────────
+                ticket_number = await db.create_ticket(user_key)
+                position = await db.get_queue_position(user_key)
+        finally:
+            _user_locks.pop(user_key, None)
 
         # ── Everything below the lock is non-critical (I/O, notifications) ──
         estimated_wait = position * 5
 
         # ── DM the user ──────────────────────────────────────────────────────
+        dm_sent = True
         try:
             await user.send(
                 f"**Support Ticket Created** \U0001f3ab\n"
@@ -83,8 +88,10 @@ class RequestSupportView(discord.ui.View):
                 "Please keep your DMs open."
             )
         except discord.Forbidden:
+            dm_sent = False
             logger.warning("Cannot DM user %s — DMs may be disabled.", user.id)
         except discord.HTTPException as exc:
+            dm_sent = False
             logger.error("DM to user %s failed: %s", user.id, exc)
 
         # ── Post embed to queue board ─────────────────────────────────────────
@@ -100,23 +107,37 @@ class RequestSupportView(discord.ui.View):
                 embed.add_field(name="User", value=user.mention, inline=True)
                 embed.add_field(name="Position", value=f"#{position}", inline=True)
                 embed.add_field(name="Status", value="`queued`", inline=True)
-                embed.set_footer(text=f"Discord ID: {user.id}")
+                if not dm_sent:
+                    embed.add_field(
+                        name="DM",
+                        value="⚠️ Could not DM the user — they may have DMs disabled.",
+                        inline=False,
+                    )
                 try:
                     await channel.send(embed=embed)
                 except (discord.Forbidden, discord.HTTPException) as exc:
                     logger.error("Failed to post to queue board: %s", exc)
 
-        await interaction.followup.send(
+        confirmation = (
             f"\U0001f3ab **Ticket #{ticket_number} created!**\n"
             f"You are **#{position}** in the queue (~{estimated_wait} min wait).\n"
-            "Check your DMs for details. You'll be pinged here when it's your turn.",
-            ephemeral=True,
         )
+        if dm_sent:
+            confirmation += (
+                "Check your DMs for details. You'll be pinged here when it's your turn."
+            )
+        else:
+            confirmation += (
+                "⚠️ I couldn't DM you — please enable DMs from server members so you receive ticket updates."
+            )
+
+        await interaction.followup.send(confirmation, ephemeral=True)
 
         logger.info(
-            "Ticket #%d created | user=%s (%s) | position=%d",
+            "Ticket #%d created | user=%s (%s) | position=%d | dm_sent=%s",
             ticket_number,
             user.id,
             user.name,
             position,
+            dm_sent,
         )
